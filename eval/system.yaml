@@ -3,11 +3,12 @@
 # LLM Configuration
 llm:
   provider: "openai"          # Judge LLM Provider (openai, gemini etc..)
-  model: "gpt-4o-mini"        # Model name for the provider
+  model: "gpt-5.2"            # Model name for the provider
   temperature: 0.0            # Generation temperature
   max_tokens: 512             # Maximum tokens in response
   timeout: 300                # Request timeout in seconds
   num_retries: 3              # Retry attempts
+  cache_enabled: false        # rioloc: disable cache
 
 # API Configuration
 # Only query endpoint is supported
@@ -18,8 +19,8 @@ api:
   timeout: 300                         # API request timeout in seconds
 
   # API input configuration
-  provider: "openai"                   # LLM provider for queries
-  model: "gpt-4o-mini"                 # Model to use for queries
+  provider: "my_openai"                # LLM provider for queries
+  model: "gpt-5.2"                     # Model to use for queries
   no_tools: null                       # Whether to bypass tools and MCP servers (optional)
   system_prompt: null                  # System prompt (default None)
 
@@ -33,53 +34,28 @@ metrics_metadata:
     "ragas:response_relevancy":
       threshold: 0.7
       description: "How relevant the response is to the question"
-      default: false  # By default the value is false
+      default: true
 
+    # Identify if the model is hallucinating or not
     "ragas:faithfulness":
       threshold: 0.7
       description: "How faithful the response is to the provided context"
-
-    # Ragas Context/Retrieval Evaluation metrics
-    "ragas:context_recall":
-      threshold: 0.7
-      description: "Did we fetch every fact the answer needs?"
-
-    "ragas:context_precision_with_reference":
-      threshold: 0.7
-      description: "How precise the retrieved context is (with reference)"
-
-    "ragas:context_precision_without_reference":
-      threshold: 0.7
-      description: "How precise the retrieved context is (without reference)"
+      default: true
 
     "ragas:context_relevance":
       threshold: 0.7
       description: "Is what we retrieved actually relevant to user query?"
+      default: true
 
     # Custom metrics
     "custom:answer_correctness":
       threshold: 0.7
       description: "Correctness vs expected answer using custom LLM evaluation"
-      default: true  # This metric is applied by default when no turn_metrics specified
+      default: true
 
     "custom:tool_eval":
       description: "Tool call evaluation comparing expected vs actual tool calls"
-
-  # Conversation-level metrics metadata
-  conversation_level:
-    # DeepEval metrics
-    "deepeval:conversation_completeness":
-      threshold: 0.7
-      description: "How completely the conversation addresses user intentions"
-      default: false
-
-    "deepeval:conversation_relevancy":
-      threshold: 0.7
-      description: "How relevant the conversation is to the topic/context"
-
-    "deepeval:knowledge_retention":
-      threshold: 0.7
-      description: "How well the model retains information from previous turns"
+      default: true
 
 # Output Configuration
 output:
@@ -87,8 +63,6 @@ output:
   base_filename: "evaluation"
   enabled_outputs:          # Enable specific output types
     - csv                   # Detailed results CSV
-    - json                  # Summary JSON with statistics
-    # - txt                   # Human-readable summary
 
   # CSV columns to include
   csv_columns:
@@ -96,7 +70,6 @@ output:
     - "turn_id"
     - "metric_identifier"
     - "score"
-    - "threshold"
     - "result"
     - "reason"
     - "query"

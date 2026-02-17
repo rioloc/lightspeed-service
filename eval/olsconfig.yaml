@@ -1,0 +1,42 @@
+llm_providers:
+  - name: my_openai
+    type: openai
+    credentials_path: openai_api_key.txt
+    models:
+      - name: gpt-5.2
+
+mcp_servers:
+  - name: obs-mcp
+    url: 'http://127.0.0.1:9100/mcp'
+    headers:
+      kubernetes-authorization: kubernetes
+    timeout: 5
+  - name: openshift-mcp-server
+    url: 'http://127.0.0.1:8089/mcp'
+    timeout: 5
+
+ols_config:
+  conversation_cache:
+    type: memory
+    memory:
+      max_entries: 10000
+  
+  default_provider: my_openai
+  default_model: gpt-5.2
+
+  authentication_config:
+    module: "noop-with-token"
+
+  user_data_collection:
+    feedback_disabled: true
+    feedback_storage: "user-data/feedback"
+    transcripts_disabled: true
+    transcripts_storage: "user-data/transcripts"
+
+dev_config:
+  enable_dev_ui: true
+  disable_auth: false
+  disable_tls: true
+  uvicorn_port_number: 8080
+  llm_params:
+    temperature: 0.0
