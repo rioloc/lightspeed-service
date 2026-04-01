@@ -53,7 +53,7 @@ class GeneratePrompt:
             )
 
         agent_instructions = prompts.AGENT_INSTRUCTION_GENERIC.strip()
-        if ModelFamily.GRANITE in model:
+        if ModelFamily.GRANITE in model.lower():
             agent_instructions = prompts.AGENT_INSTRUCTION_GRANITE.strip()
         return agent_instructions + "\n" + prompts.AGENT_SYSTEM_INSTRUCTION.strip()
 

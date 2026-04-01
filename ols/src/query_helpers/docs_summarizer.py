@@ -4,7 +4,9 @@
 import asyncio
 import json
 import logging
+import re
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Coroutine, NamedTuple, Optional, TypeAlias
 
@@ -55,27 +57,108 @@ class RoundLLMResult(NamedTuple):
     should_stop: bool
 
 
+_GRANITE_TOOL_CALL_PREFIX = ("", "<", "tool", "_", "call", ">")
+
+
 def skip_special_chunk(
     chunk_text: str,
     chunk_counter: int,
     model_name: str,
     final_round: bool,
+    granite_tool_call_detected: list[bool],
 ) -> bool:
-    """Handle special chunk."""
-    # Handle granite tool call identifier chunks.
-    # This is a workaround as until these chunks are recieved, it is
-    # difficult to associate these with tool call (with langchain).
-    # We can implement more sophisticated solution but may not be worth doing.
-    if constants.ModelFamily.GRANITE in model_name and not final_round:
-        return (
-            (chunk_counter == 0 and chunk_text == "")
-            or (chunk_counter == 1 and chunk_text == "<")
-            or (chunk_counter == 2 and chunk_text == "tool")
-            or (chunk_counter == 3 and chunk_text == "_")
-            or (chunk_counter == 4 and chunk_text == "call")
-            or (chunk_counter == 5 and chunk_text == ">")
-        )
+    """Handle special chunk.
+
+    For Granite models the LLM emits tool calls as plain text starting with a
+    ``<tool_call>`` prefix followed by a JSON payload.  We need to suppress
+    **all** of that text so the raw JSON is not streamed to the user.
+
+    ``granite_tool_call_detected`` is a single-element list used as a mutable
+    flag shared across calls within the same collection round.  Once the full
+    ``<tool_call>`` prefix has been matched, the flag is set and every
+    subsequent text chunk in the round is suppressed.
+    """
+    if constants.ModelFamily.GRANITE in model_name.lower() and not final_round:
+        if granite_tool_call_detected[0]:
+            return True
+
+        if (
+            chunk_counter < len(_GRANITE_TOOL_CALL_PREFIX)
+            and chunk_text == _GRANITE_TOOL_CALL_PREFIX[chunk_counter]
+        ):
+            if chunk_counter == len(_GRANITE_TOOL_CALL_PREFIX) - 1:
+                granite_tool_call_detected[0] = True
+            return True
     return False
+
+
+_GRANITE_TEXT_TOOL_CALL_PATTERNS = [
+    # <tool_call>JSON</tool_call>  — greedy to handle nested braces
+    re.compile(r"<tool_call>\s*(\{.*\})\s*(?:</tool_call>)?", re.DOTALL),
+    # <tool_call>[JSON]  (list format from prompt example)
+    re.compile(r"<tool_call>\s*(\[.*\])\s*(?:</tool_call>)?", re.DOTALL),
+    # ```json ... ```
+    re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL),
+]
+
+
+def _parse_granite_text_tool_calls(
+    text: str,
+    available_tools: dict[str, StructuredTool],
+) -> list[dict[str, object]]:
+    """Parse tool calls that Granite emits as plain-text JSON.
+
+    Granite models behind OpenAI-compatible proxies sometimes emit tool calls
+    as ``<tool_call>JSON</tool_call>``, markdown JSON code blocks, or bare JSON
+    instead of structured ``tool_call_chunks``.  This function extracts those
+    and converts them into the LangChain tool-call dict format.
+
+    Returns an empty list when no valid tool call is found.
+    """
+    payload = None
+    for pattern in _GRANITE_TEXT_TOOL_CALL_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            try:
+                raw = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+            # The list format wraps tool calls in an array.
+            if isinstance(raw, list) and raw:
+                payload = raw[0]
+            elif isinstance(raw, dict):
+                payload = raw
+            if payload:
+                break
+
+    if payload is None:
+        # Last resort: try bare JSON object.
+        stripped = text.strip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                return []
+        else:
+            return []
+
+    # Granite uses "function" or "name" for the tool name.
+    tool_name = payload.get("function") or payload.get("name")
+    if not tool_name or tool_name not in available_tools:
+        return []
+
+    args = payload.get("arguments", {})
+    if not isinstance(args, dict):
+        return []
+
+    return [
+        {
+            "name": tool_name,
+            "args": args,
+            "id": f"granite_text_{uuid.uuid4().hex[:8]}",
+            "type": "tool_call",
+        }
+    ]
 
 
 def tool_calls_from_tool_calls_chunks(
@@ -426,6 +509,7 @@ class DocsSummarizer(QueryHelper):
         content: list[Any],
         chunk_counter: int,
         is_final_round: bool,
+        granite_tool_call_detected: list[bool],
     ) -> list[StreamedChunk]:
         """Extract text and reasoning StreamedChunks from list-format content blocks.
 
@@ -440,7 +524,11 @@ class DocsSummarizer(QueryHelper):
                 case "text":
                     text = block.get("text", "")
                     if text and not skip_special_chunk(
-                        text, chunk_counter, self.model, is_final_round
+                        text,
+                        chunk_counter,
+                        self.model,
+                        is_final_round,
+                        granite_tool_call_detected,
                     ):
                         result.append(
                             StreamedChunk(type=StreamChunkType.TEXT, text=text)
@@ -469,6 +557,7 @@ class DocsSummarizer(QueryHelper):
         tool_call_chunks: list[AIMessageChunk] = []
         all_chunks: list[AIMessageChunk] = []
         streamed_chunks: list[StreamedChunk] = []
+        granite_tool_call_detected: list[bool] = [False]
         chunk_counter = 0
         try:
             async with asyncio.timeout(constants.TOOL_CALL_ROUND_TIMEOUT):
@@ -507,7 +596,11 @@ class DocsSummarizer(QueryHelper):
                         tool_call_chunks.append(chunk)
                     elif isinstance(chunk.content, str):
                         if chunk.content and not skip_special_chunk(
-                            chunk.content, chunk_counter, self.model, is_final_round
+                            chunk.content,
+                            chunk_counter,
+                            self.model,
+                            is_final_round,
+                            granite_tool_call_detected,
                         ):
                             streamed_chunks.append(
                                 StreamedChunk(
@@ -517,7 +610,10 @@ class DocsSummarizer(QueryHelper):
                     elif isinstance(chunk.content, list):
                         streamed_chunks.extend(
                             self._streamed_chunks_from_list_content(
-                                chunk.content, chunk_counter, is_final_round
+                                chunk.content,
+                                chunk_counter,
+                                is_final_round,
+                                granite_tool_call_detected,
                             )
                         )
 
@@ -639,12 +735,16 @@ class DocsSummarizer(QueryHelper):
         token_handler: TokenHandler,
         tool_token_usage: ToolTokenUsage,
         max_tokens_for_tools: int,
+        pre_parsed_tool_calls: list[dict[str, object]] | None = None,
     ) -> AsyncGenerator[StreamedChunk, None]:
         """Resolve, execute, and stream one round of tool calls."""
         tool_tokens_used = tool_token_usage.used
 
         # Finalize streamed chunks into complete tool calls.
-        tool_calls = tool_calls_from_tool_calls_chunks(tool_call_chunks)
+        if pre_parsed_tool_calls:
+            tool_calls = pre_parsed_tool_calls
+        else:
+            tool_calls = tool_calls_from_tool_calls_chunks(tool_call_chunks)
         tool_call_definitions, skipped_tool_messages = (
             self._resolve_tool_call_definitions(
                 tool_calls,
@@ -866,20 +966,49 @@ class DocsSummarizer(QueryHelper):
                 token_counter=token_counter,
                 round_index=i,
             )
-            for streamed_chunk in round_result.streamed_chunks:
-                yield streamed_chunk
-            if round_result.should_stop:
+
+            # Granite models behind OpenAI-compatible proxies may emit tool
+            # calls as plain-text JSON instead of structured tool_call_chunks.
+            # Detect this and synthesize proper tool call data so the tool
+            # execution pipeline can handle it.
+            granite_text_tool_calls: list[dict[str, object]] = []
+            if (
+                not round_result.tool_call_chunks
+                and not is_final_round
+                and constants.ModelFamily.GRANITE in self.model.lower()
+                and round_result.streamed_chunks
+            ):
+                text = "".join(
+                    c.text for c in round_result.streamed_chunks
+                    if c.type == StreamChunkType.TEXT and c.text
+                )
+                granite_text_tool_calls = _parse_granite_text_tool_calls(
+                    text, all_tools_dict
+                )
+
+            if granite_text_tool_calls:
+                # Suppress the raw JSON text — do not stream it to the user.
+                logger.info(
+                    "Granite text-based tool call detected in round %s: %s",
+                    i,
+                    granite_text_tool_calls,
+                )
+            else:
+                for streamed_chunk in round_result.streamed_chunks:
+                    yield streamed_chunk
+
+            if round_result.should_stop and not granite_text_tool_calls:
                 return
 
             # exit if this was the final round
             if is_final_round:
                 break
 
-            if not round_result.tool_call_chunks:
+            if not round_result.tool_call_chunks and not granite_text_tool_calls:
                 break
 
             # tool calling part
-            if round_result.tool_call_chunks:
+            if round_result.tool_call_chunks or granite_text_tool_calls:
                 # Phase 2: resolve and execute tool calls for this round.
                 tool_token_usage = ToolTokenUsage(used=tool_tokens_used)
                 # No outer timeout here — each MCP server enforces its own
@@ -895,6 +1024,7 @@ class DocsSummarizer(QueryHelper):
                         token_handler=token_handler,
                         tool_token_usage=tool_token_usage,
                         max_tokens_for_tools=max_tokens_for_tools,
+                        pre_parsed_tool_calls=granite_text_tool_calls or None,
                     ):
                         yield streamed_chunk
                 except Exception:

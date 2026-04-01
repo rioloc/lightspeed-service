@@ -1101,7 +1101,7 @@ def test_streamed_chunks_from_list_content_text_and_reasoning():
         {"type": "reasoning", "summary": [{"text": ""}, "not-a-dict-part"]},
     ]
     chunks = summarizer._streamed_chunks_from_list_content(
-        content, chunk_counter=10, is_final_round=False
+        content, chunk_counter=10, is_final_round=False, granite_tool_call_detected=[False]
     )
     assert len(chunks) == 2
     assert chunks[0].type == StreamChunkType.TEXT
@@ -1117,7 +1117,7 @@ def test_streamed_chunks_from_list_content_multiple_reasoning_parts():
         {"type": "reasoning", "summary": [{"text": "step 1"}, {"text": "step 2"}]},
     ]
     chunks = summarizer._streamed_chunks_from_list_content(
-        content, chunk_counter=0, is_final_round=False
+        content, chunk_counter=0, is_final_round=False, granite_tool_call_detected=[False]
     )
     assert len(chunks) == 2
     assert all(c.type == StreamChunkType.REASONING for c in chunks)
